@@ -13,7 +13,7 @@ load_dotenv()
  
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
  
-app = FastAPI(title="Gemini Text Processing API")
+app = FastAPI(title="Gemini Text Processing API", version=2.0)
  
 class TextInput(BaseModel):
     text: str
@@ -76,7 +76,7 @@ async def few_shot_prompting(data: TextInput):
     return response.text.strip()
  
 @app.post("/v1/zero_shot")
-async def few_shot_prompting(data: TextInput):
+async def zero_shot_prompting(data: TextInput):
     prompt=f"{data.text}"
  
     response = await asyncio.to_thread(
