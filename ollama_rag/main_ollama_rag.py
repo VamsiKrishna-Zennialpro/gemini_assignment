@@ -7,7 +7,7 @@ from typing import List
 # LangChain / loaders / vectorstore / embeddings / llm
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
-from langchain_community.document_loaders import UnstructuredPDFLoader, TextLoader
+from langchain_community.document_loaders import PyMuPDFLoader, PDFMinerLoader, TextLoader
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
@@ -20,19 +20,16 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # === CONFIGURATION ===
 DATA_DIR = "data"
 PERSIST_DIR = "vectorstore_ollama"
-OLLAMA_MODEL = "llama3"                      # change to your Ollama model name
+OLLAMA_MODEL = "llama3"
 EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
 TOP_K = 6
 
-# PostgreSQL connection (update to your credentials)
-# Examples:
-# "postgresql+psycopg2://user:password@localhost:5432/dbname"
-# "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+# PostgreSQL connection
 DB_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
 
 # Memory / summarization params
-RECENT_HISTORY_LIMIT = 5        # short-term memory size (recent turns)
-SUMMARY_INTERVAL = 10           # create/update long-term summary every N interactions
+RECENT_HISTORY_LIMIT = 5
+SUMMARY_INTERVAL = 10
 
 # === PATCH NUMPY FOR COMPATIBILITY (NumPy 2.0) ===
 import numpy as np
@@ -60,7 +57,7 @@ class MemorySummary(Base):
     summary_text = Column(Text)
     timestamp = Column(TIMESTAMP, default=datetime.datetime.utcnow)
 
-# Create engine & session (wrapped in try/except to avoid crashing if DB down)
+# --- PostgreSQL setup ---
 Session = None
 try:
     engine = create_engine(DB_URL)
@@ -70,9 +67,9 @@ try:
 except Exception as e:
     print(f"❌ PostgreSQL connection failed: {e}\nProceeding without DB logging/memory (Session=None).")
 
-# === DB helpers ===
+# === DATABASE HELPERS ===
 def log_interaction(prompt: str, response: str, temperature: float, top_p: float, max_tokens: int):
-    """Store each chat interaction in PostgreSQL (if available)."""
+    """Store chat interaction in PostgreSQL."""
     if not Session:
         print("⚠️ Skipping DB logging (PostgreSQL not connected).")
         return
@@ -87,7 +84,6 @@ def log_interaction(prompt: str, response: str, temperature: float, top_p: float
         )
         session.add(entry)
         session.commit()
-        # no need to flush
     except Exception as e:
         print(f"⚠️ Failed to log to PostgreSQL: {e}")
         session.rollback()
@@ -95,7 +91,6 @@ def log_interaction(prompt: str, response: str, temperature: float, top_p: float
         session.close()
 
 def load_recent_history(limit: int = RECENT_HISTORY_LIMIT) -> List[ChatHistory]:
-    """Return last `limit` chat history entries in chronological order."""
     if not Session:
         return []
     session = Session()
@@ -119,7 +114,6 @@ def show_recent_chats(limit: int = RECENT_HISTORY_LIMIT):
         print(f"[{ts}] You: {h.user_prompt}\n    Assistant: {h.assistant_response}\n")
 
 def get_memory_summary() -> str:
-    """Fetch the latest long-term memory summary (text) or empty string."""
     if not Session:
         return ""
     session = Session()
@@ -148,30 +142,50 @@ def save_memory_summary(summary_text: str):
         session.close()
 
 # === DOCUMENT PROCESSING ===
-def load_documents(data_dir: str = DATA_DIR):
-    """Load PDFs and text files. Uses UnstructuredPDFLoader which tries OCR if needed."""
+def load_documents(data_dir=DATA_DIR):
+    """Load PDFs and text files with reliable text extraction."""
     docs = []
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"❌ Data directory not found: {data_dir}")
 
     for file in os.listdir(data_dir):
         path = os.path.join(data_dir, file)
+        file_docs = []
+
         if file.lower().endswith(".pdf"):
-            loader = UnstructuredPDFLoader(path)
-            file_docs = loader.load()
+            try:
+                loader = PyMuPDFLoader(path)
+                file_docs = loader.load()
+                print(f"✅ Loaded text from {file} using PyMuPDF ({len(file_docs)} pages)")
+            except Exception as e:
+                print(f"⚠️ PyMuPDF failed on {file}, trying PDFMiner: {e}")
+                try:
+                    loader = PDFMinerLoader(path)
+                    file_docs = loader.load()
+                    print(f"✅ Loaded text from {file} using PDFMiner ({len(file_docs)} pages)")
+                except Exception as e2:
+                    print(f"❌ Failed to read {file} with both loaders: {e2}")
+                    continue
         elif file.lower().endswith(".txt"):
             loader = TextLoader(path)
             file_docs = loader.load()
+            print(f"✅ Loaded text from {file}")
         else:
             continue
 
         for d in file_docs:
-            # Attach filename metadata and prefix page content with a marker
             d.metadata["source_file"] = file
-            d.page_content = f"This content is from '{file}'.\n\n{d.page_content}"
+            d.page_content = f"This content is from '{file}'.\n\n{d.page_content.strip()}"
         docs.extend(file_docs)
 
-    print(f"📄 Loaded {len(docs)} document pages/segments from '{data_dir}'.")
+    # Warn for unreadable files
+    for f in os.listdir(data_dir):
+        if f.lower().endswith(".pdf"):
+            sample = next((d for d in docs if d.metadata.get("source_file") == f), None)
+            if not sample or len(sample.page_content.strip()) < 100:
+                print(f"⚠️ Warning: No readable text extracted from '{f}'. (Might be scanned or image-based.)")
+
+    print(f"📄 Loaded {len(docs)} total documents from '{data_dir}'.")
     return docs
 
 def add_file_index_to_docs(docs, data_dir: str = DATA_DIR):
@@ -211,34 +225,25 @@ def split_documents(docs):
 # === VECTORSTORE HANDLING ===
 def build_or_load_vectorstore(chunks, persist_directory=PERSIST_DIR):
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    adjusted_docs = []
-    for doc in chunks:
-        src = doc.metadata.get("source_file", "unknown file")
-        if "metadata about" in doc.page_content.lower():
-            doc.page_content = (
-                f"[Metadata summary about {src}] "
-                f"(Use only if asked about file details like size or type.)\n{doc.page_content}"
-            )
-        else:
-            doc.page_content = (
-                f"[Main content from {src}] "
-                f"(Contains information for summarization or Q&A.)\n{doc.page_content}"
-            )
-        adjusted_docs.append(doc)
+    print("📦 Checking existing Chroma vectorstore...")
 
     if os.path.exists(persist_directory) and os.listdir(persist_directory):
-        print("📦 Loading existing Chroma vectorstore...")
         db = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+        print("✅ Loaded existing vectorstore.")
+        if chunks:
+            print("🔁 Adding new documents to existing vectorstore...")
+            db.add_documents(chunks)
+            db.persist()
+            print("✅ Added new documents.")
     else:
         print("🧠 Creating new Chroma vectorstore...")
-        db = Chroma.from_documents(adjusted_docs, embeddings, persist_directory=persist_directory)
+        db = Chroma.from_documents(chunks, embeddings, persist_directory=persist_directory)
         db.persist()
         print("✅ Vectorstore created and persisted.")
     return db
 
 # === OLLAMA LLM ===
-def create_ollama_llm(model_name=OLLAMA_MODEL, temperature=0.4, top_p=0.9, num_predict=512):
-    # enforce types to satisfy pydantic validation
+def create_ollama_llm(model_name=OLLAMA_MODEL, temperature=0.4, top_p=0.8, num_predict=512):
     llm = Ollama(
         model=model_name,
         temperature=float(temperature),
@@ -259,9 +264,15 @@ def build_context_prompt(history_rows: List[ChatHistory]) -> str:
 
 # === MAIN ===
 def main():
-    # load and index documents
     print("🔍 Loading documents...")
     docs = load_documents()
+
+    for d in docs:
+        if "AI.pdf" in d.metadata.get("source_file", ""):
+            print("\n🔍 Sample from AI.pdf:\n")
+            print(d.page_content[:500])
+            break
+
     docs = add_file_index_to_docs(docs)
     docs = add_file_metadata_docs(docs)
 
@@ -271,18 +282,12 @@ def main():
     print("🧭 Building / loading vectorstore...")
     db = build_or_load_vectorstore(chunks)
 
-    # defaults
-    temperature = 0.4
-    top_p = 0.9
-    max_tokens = 512
-
+    temperature, top_p, max_tokens = 0.4, 0.9, 512
     print("🤖 Creating Ollama LLM wrapper...")
     llm = create_ollama_llm(temperature=temperature, top_p=top_p, num_predict=max_tokens)
-
     retriever = db.as_retriever(search_kwargs={"k": TOP_K})
     qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
 
-    # load memory
     memory_summary = get_memory_summary()
     recent_history = load_recent_history(RECENT_HISTORY_LIMIT)
     context_prompt = build_context_prompt(recent_history)
@@ -290,14 +295,12 @@ def main():
         print("🧠 Loaded summarized long-term memory.")
     if recent_history:
         print(f"🧠 Loaded {len(recent_history)} recent interactions.")
-
-    # show recent chats brief
     show_recent_chats(RECENT_HISTORY_LIMIT)
 
     print("\n✅ RAG chatbot + memory ready! Type 'exit' to quit.")
-    print("💡 Commands: set temperature 0.8 | set top_p 0.7 | set max_tokens 300 | summarize memory\n")
+    print("💡 Commands: set temperature | set top_p | set max_tokens | reload data | summarize memory\n")
 
-    interaction_count = 0  # total interactions (used for periodic summarization)
+    interaction_count = 0
 
     while True:
         query = input("🗣️ You: ").strip()
@@ -306,140 +309,29 @@ def main():
         if query.lower() in {"exit", "quit"}:
             break
 
-        # dynamic settings
-        if query.lower().startswith("set temperature"):
-            try:
-                temperature = float(query.split()[-1])
-                llm = create_ollama_llm(temperature=temperature, top_p=top_p, num_predict=max_tokens)
-                qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
-                print(f"✅ Temperature updated to {temperature}\n")
-            except Exception:
-                print("⚠️ Invalid value. Example: set temperature 0.7\n")
+        if query.lower() == "reload data":
+            print("🔁 Reloading new documents from 'data' folder...")
+            new_docs = load_documents()
+            new_docs = add_file_index_to_docs(new_docs)
+            new_docs = add_file_metadata_docs(new_docs)
+            new_chunks = split_documents(new_docs)
+            db = build_or_load_vectorstore(new_chunks)
+            retriever = db.as_retriever(search_kwargs={"k": TOP_K})
+            qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+            print("✅ Data reloaded and vectorstore updated.\n")
             continue
 
-        if query.lower().startswith("set top_p"):
-            try:
-                top_p = float(query.split()[-1])
-                llm = create_ollama_llm(temperature=temperature, top_p=top_p, num_predict=max_tokens)
-                qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
-                print(f"✅ top_p updated to {top_p}\n")
-            except Exception:
-                print("⚠️ Invalid value. Example: set top_p 0.85\n")
-            continue
-
-        if query.lower().startswith("set max_tokens"):
-            try:
-                max_tokens = int(query.split()[-1])
-                llm = create_ollama_llm(temperature=temperature, top_p=top_p, num_predict=max_tokens)
-                qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
-                print(f"✅ max_tokens updated to {max_tokens}\n")
-            except Exception:
-                print("⚠️ Invalid value. Example: set max_tokens 256\n")
-            continue
-
-        if query.lower() == "summarize memory":
-            # manual trigger to regenerate long-term summary
-            print("🔁 Regenerating long-term memory summary...")
-            # load all history
-            if not Session:
-                print("⚠️ No DB session; cannot summarize history.")
-                continue
-            session = Session()
-            try:
-                chats = session.query(ChatHistory).order_by(ChatHistory.timestamp.asc()).all()
-                session.close()
-            except Exception as e:
-                print(f"⚠️ Failed to load history for summary: {e}")
-                session.close()
-                continue
-
-            if not chats:
-                print("⚠️ No chat history to summarize.")
-                continue
-
-            full_history = "\n".join([f"You: {c.user_prompt}\nAssistant: {c.assistant_response}" for c in chats])
-            summary_prompt = (
-                "Summarize the following conversation history into a short, concise memory "
-                "listing key topics, facts, preferences, and stable user info to remember:\n\n"
-                + full_history
-            )
-
-            # use llm to summarize directly (no retrieval)
-            try:
-                raw = llm.invoke(summary_prompt)
-                if isinstance(raw, dict) and "result" in raw:
-                    summary_text = raw["result"]
-                else:
-                    summary_text = str(raw)
-                save_memory_summary(summary_text)
-            except Exception as e:
-                print(f"⚠️ Summarization failed: {e}")
-            continue
-
-        # Compose prompt: memory_summary + recent context + user query
+        # Normal query
         memory_summary = get_memory_summary()
         full_user_prompt = f"{memory_summary}\n\n{context_prompt}\nUser: {query}\n"
 
         try:
-            # Use retrieval-enhanced QA with the composed prompt
             response = qa.invoke({"query": full_user_prompt})
-            # response may be dict with 'result'
-            if isinstance(response, dict) and "result" in response:
-                answer = response["result"]
-            else:
-                answer = str(response)
+            answer = response["result"] if isinstance(response, dict) else str(response)
             print(f"\n💬 Assistant: {answer}\n")
-
-            # log and update context
             log_interaction(query, answer, temperature, top_p, max_tokens)
-            context_prompt += f"You: {query}\nAssistant: {answer}\n"
-            interaction_count += 1
-
-            # Periodic automatic summarization
-            if interaction_count % SUMMARY_INTERVAL == 0:
-                print("🧩 Summarizing long-term memory (automatic)...")
-                if not Session:
-                    print("⚠️ No DB session; skipping automatic summarization.")
-                    continue
-                session = Session()
-                try:
-                    chats = session.query(ChatHistory).order_by(ChatHistory.timestamp.asc()).all()
-                    session.close()
-                    if chats:
-                        full_history = "\n".join([f"You: {c.user_prompt}\nAssistant: {c.assistant_response}" for c in chats])
-                        summary_prompt = (
-                            "Summarize the following conversation history into a short, concise memory "
-                            "listing key topics, facts, preferences, and stable user info to remember:\n\n"
-                            + full_history
-                        )
-                        # use llm (no retrieval)
-                        raw = llm.invoke(summary_prompt)
-                        if isinstance(raw, dict) and "result" in raw:
-                            summary_text = raw["result"]
-                        else:
-                            summary_text = str(raw)
-                        save_memory_summary(summary_text)
-                        # refresh memory_summary variable
-                        memory_summary = summary_text
-                        print("🧠 Long-term memory updated (automatic).")
-                except Exception as e:
-                    print(f"⚠️ Automatic summarization failed: {e}")
-
         except Exception as e:
-            print(f"\n❌ Error during QA/invoke: {e}\n")
-            # fallback: try direct llm generation without retrieval context
-            try:
-                raw = llm.invoke(query)
-                if isinstance(raw, dict) and "result" in raw:
-                    fallback_answer = raw["result"]
-                else:
-                    fallback_answer = str(raw)
-                print(f"\n💬 Assistant (fallback): {fallback_answer}\n")
-                log_interaction(query, fallback_answer, temperature, top_p, max_tokens)
-                context_prompt += f"You: {query}\nAssistant: {fallback_answer}\n"
-                interaction_count += 1
-            except Exception as e2:
-                print(f"⚠️ Fallback generation failed: {e2}")
+            print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     main()
